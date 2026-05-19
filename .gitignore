@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment variables
+.env
+
+# ChromaDB persisted data (generated at runtime)
+chroma_db/
+
+# HuggingFace model cache
+.cache/
+
+# macOS metadata
+.DS_Store
+._*
+
+# IDE
+.vscode/
+.idea/
