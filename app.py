@@ -1,5 +1,5 @@
 """
-Simple RAG System — Streamlit UI with guardrails at every layer.
+Simple RAG System — Streamlit UI with guardrails and full error handling.
 Run: streamlit run app.py
 """
 
@@ -14,49 +14,82 @@ from rag.chunker import chunk_text
 from rag.embedder import Embedder
 from rag.store import VectorStore
 from rag.generator_local import generate_answer_local
+from rag.exceptions import (
+    RAGError, LoaderError, ChunkerError,
+    EmbedderError, EmbedderTimeoutError,
+    StoreError, StoreUnavailableError,
+    GeneratorError, GeneratorTimeoutError,
+)
 from rag.guardrails import (
-    file_guardrails,
-    input_guardrails,
-    retrieval_guardrails,
-    output_guardrails,
-    pii_detector,
+    file_guardrails, input_guardrails,
+    retrieval_guardrails, output_guardrails, pii_detector,
 )
 from rag import audit_logger
 
-SUPPORTED = [".txt", ".md", ".pdf", ".docx", ".doc",
-             ".xlsx", ".xls", ".csv", ".pptx"]
+SUPPORTED    = [".txt", ".md", ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".pptx"]
+MAX_MESSAGES = 50   # cap session history to prevent unbounded RAM growth
 
 # ── page config ───────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="localRAG",
-    page_icon="🔍",
-    layout="wide",
-)
+st.set_page_config(page_title="localRAG", page_icon="🔍", layout="wide")
+
 
 # ── shared resources ──────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading embedding model…")
 def get_embedder():
     return Embedder()
 
+
 @st.cache_resource
 def get_store():
     return VectorStore()
 
 
+def _safe_get_embedder():
+    """Return Embedder or show an error and stop the page."""
+    try:
+        return get_embedder()
+    except EmbedderError as exc:
+        st.error(f"**Embedding model failed to load:** {exc}")
+        audit_logger.log_error("EMBEDDER", "MODEL_LOAD_FAILURE", str(exc))
+        st.stop()
+
+
+def _safe_get_store():
+    """Return VectorStore or show an error and stop the page."""
+    try:
+        return get_store()
+    except StoreUnavailableError as exc:
+        st.error(f"**Vector store unavailable:** {exc}")
+        audit_logger.log_error("STORE", "INIT_FAILURE", str(exc))
+        st.stop()
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 def show_result(result, *, location=st):
-    """Render guardrail violations (red) and warnings (yellow)."""
     for v in result.violations:
         location.error(f"**Blocked:** {v}")
     for w in result.warnings:
         location.warning(f"**Notice:** {w}")
 
 
+def _safe_unlink(path: str) -> None:
+    """Delete a file without raising if it is already gone."""
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _trim_messages() -> None:
+    """Keep only the last MAX_MESSAGES entries to cap RAM usage."""
+    if len(st.session_state.messages) > MAX_MESSAGES:
+        st.session_state.messages = st.session_state.messages[-MAX_MESSAGES:]
+
+
 # ── sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("📂 Knowledge Base")
     st.caption("100% local · no API key needed")
-
     st.divider()
 
     uploaded_files = st.file_uploader(
@@ -66,87 +99,108 @@ with st.sidebar:
         help="PDF, DOCX, XLSX, CSV, PPTX, TXT, MD — max 20 MB each",
     )
 
-    if st.button("Ingest uploaded files", type="primary",
-                 disabled=not uploaded_files):
-
-        embedder = get_embedder()
-        store    = get_store()
+    if st.button("Ingest uploaded files", type="primary", disabled=not uploaded_files):
+        embedder = _safe_get_embedder()
+        store    = _safe_get_store()
         total    = 0
 
         for uf in uploaded_files:
             st.markdown(f"**{uf.name}**")
-            file_bytes  = uf.read()
-            size_bytes  = len(file_bytes)
-            suffix      = Path(uf.name).suffix.lower()
-
-            # ── GUARDRAIL 1: file validation ──────────────────────────────
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp.write(file_bytes)
-                tmp_path = tmp.name
-
-            file_result = file_guardrails.validate(tmp_path, uf.name, size_bytes)
-            show_result(file_result)
-
-            if not file_result.passed:
-                audit_logger.log_guardrail_violation(
-                    layer="FILE_INGEST",
-                    violation_type="FILE_VALIDATION",
-                    details="; ".join(file_result.violations),
-                )
-                os.unlink(tmp_path)
-                continue
+            file_bytes = uf.read()
+            size_bytes = len(file_bytes)
+            suffix     = Path(uf.name).suffix.lower()
+            tmp_path   = None
 
             try:
-                with st.spinner(f"Extracting text…"):
+                # Write to temp file
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(file_bytes)
+                    tmp_path = tmp.name
+
+                # ── GUARDRAIL 1: file validation ──────────────────────────
+                file_result = file_guardrails.validate(tmp_path, uf.name, size_bytes)
+                show_result(file_result)
+                if not file_result.passed:
+                    audit_logger.log_guardrail_violation(
+                        "FILE_INGEST", "FILE_VALIDATION",
+                        "; ".join(file_result.violations),
+                    )
+                    continue
+
+                # ── parse ─────────────────────────────────────────────────
+                with st.spinner("Extracting text…"):
                     pages = load_file(tmp_path)
                     for p in pages:
                         p["source"] = uf.name
 
-                # ── GUARDRAIL 2: PII scan on ingested content ─────────────
-                full_text    = " ".join(p["text"] for p in pages)
-                pii_result   = file_guardrails.scan_content_pii(full_text)
-                pii_found    = pii_detector.scan(full_text)
+                # ── GUARDRAIL 2: PII scan ─────────────────────────────────
+                full_text  = " ".join(p["text"] for p in pages)
+                pii_result = file_guardrails.scan_content_pii(full_text)
+                pii_found  = pii_detector.scan(full_text)
                 show_result(pii_result)
-
                 if pii_result.warnings:
                     audit_logger.log_guardrail_warning(
-                        layer="FILE_INGEST",
-                        warning_type="PII_IN_DOCUMENT",
-                        details=f"{uf.name}: {', '.join(pii_found)}",
+                        "FILE_INGEST", "PII_IN_DOCUMENT",
+                        f"{uf.name}: {', '.join(pii_found)}",
                     )
 
+                # ── chunk ─────────────────────────────────────────────────
                 chunks, meta = [], []
                 for page in pages:
                     for i, c in enumerate(chunk_text(page["text"])):
                         chunks.append(c)
                         meta.append({
-                            "source": uf.name,
-                            "page": str(page["page"]),
+                            "source":      uf.name,
+                            "page":        str(page["page"]),
                             "chunk_index": i,
                         })
 
-                with st.spinner("Embedding chunks…"):
+                # ── embed + store ─────────────────────────────────────────
+                with st.spinner(f"Embedding {len(chunks)} chunks…"):
                     embeddings = embedder.embed(chunks)
-                    added      = store.add(chunks, embeddings, meta)
-                    total     += added
 
+                added  = store.add(chunks, embeddings, meta)
+                total += added
                 audit_logger.log_ingest(
-                    filename=uf.name,
-                    size_kb=size_bytes / 1024,
-                    chunks_added=added,
-                    pii_types_found=pii_found,
+                    filename=uf.name, size_kb=size_bytes / 1024,
+                    chunks_added=added, pii_types_found=pii_found,
                 )
                 st.success(f"✓ {added} chunks stored")
 
-            except Exception as e:
+            except LoaderError as exc:
+                st.error(f"**Cannot read file:** {exc}")
                 audit_logger.log_ingest(
-                    filename=uf.name, size_kb=size_bytes / 1024,
-                    chunks_added=0, pii_types_found=[],
-                    status="error", error=str(e),
+                    uf.name, size_bytes / 1024, 0, [],
+                    status="error", error=str(exc),
                 )
-                st.error(f"Failed to process: {e}")
+
+            except ChunkerError as exc:
+                st.error(f"**Chunking failed:** {exc}")
+                audit_logger.log_error("CHUNKER", "CHUNK_FAILURE", str(exc))
+
+            except EmbedderTimeoutError as exc:
+                st.error(f"**Embedding timed out:** {exc}")
+                audit_logger.log_error("EMBEDDER", "TIMEOUT", str(exc))
+
+            except EmbedderError as exc:
+                st.error(f"**Embedding failed:** {exc}")
+                audit_logger.log_error("EMBEDDER", "EMBED_FAILURE", str(exc))
+
+            except StoreError as exc:
+                st.error(f"**Storage failed:** {exc}")
+                audit_logger.log_error("STORE", "WRITE_FAILURE", str(exc))
+
+            except RAGError as exc:
+                st.error(f"**Unexpected RAG error:** {exc}")
+                audit_logger.log_error("INGEST", "RAG_ERROR", str(exc))
+
+            except Exception as exc:
+                st.error(f"**Unexpected error:** {exc}")
+                audit_logger.log_error("INGEST", "UNKNOWN_ERROR", str(exc))
+
             finally:
-                os.unlink(tmp_path)
+                if tmp_path:
+                    _safe_unlink(tmp_path)
 
         if total:
             st.info(f"Total chunks in store: {store.count()}")
@@ -154,16 +208,24 @@ with st.sidebar:
 
     st.divider()
 
-    store   = get_store()
-    sources = store.list_sources()
+    try:
+        store   = _safe_get_store()
+        sources = store.list_sources()
+    except StoreError as exc:
+        st.error(f"Cannot read knowledge base: {exc}")
+        sources = []
+
     if sources:
         st.markdown(f"**Ingested docs** ({store.count()} chunks)")
         for s in sources:
             st.markdown(f"- {s}")
         if st.button("Clear knowledge base", type="secondary"):
-            store.clear()
-            st.cache_resource.clear()
-            st.rerun()
+            try:
+                store.clear()
+                st.cache_resource.clear()
+                st.rerun()
+            except StoreError as exc:
+                st.error(f"Clear failed: {exc}")
     else:
         st.caption("No documents ingested yet.")
 
@@ -171,7 +233,7 @@ with st.sidebar:
     st.caption("Embeddings: all-MiniLM-L6-v2\nGeneration: flan-t5-base\n(both run locally)")
 
 
-# ── main tabs ─────────────────────────────────────────────────────────────────
+# ── tabs ──────────────────────────────────────────────────────────────────────
 chat_tab, audit_tab = st.tabs(["💬 Chat", "🛡️ Audit Log"])
 
 
@@ -204,18 +266,16 @@ with chat_tab:
                         st.code(h["text"], language=None)
 
     if question := st.chat_input("Ask a question about your documents…"):
-        store = get_store()
+        store = _safe_get_store()
 
-        # ── GUARDRAIL 3: input validation ─────────────────────────────────
+        # ── GUARDRAIL 3: input validation ──────────────────────────────────
         input_result = input_guardrails.validate(question)
-
         if not input_result.passed:
             for v in input_result.violations:
                 st.error(f"**Blocked:** {v}")
             audit_logger.log_guardrail_violation(
-                layer="QUERY_INPUT",
-                violation_type="INPUT_VALIDATION",
-                details="; ".join(input_result.violations),
+                "QUERY_INPUT", "INPUT_VALIDATION",
+                "; ".join(input_result.violations),
             )
             st.stop()
 
@@ -225,35 +285,55 @@ with chat_tab:
                 st.warning(f"**Notice:** {w}")
 
         st.session_state.messages.append({
-            "role": "user",
-            "content": question,
+            "role":     "user",
+            "content":  question,
             "warnings": input_result.warnings,
         })
+        _trim_messages()
 
         with st.chat_message("assistant"):
-            # ── GUARDRAIL 4: store not empty ──────────────────────────────
-            if store.count() == 0:
+            # ── GUARDRAIL 4: store not empty ───────────────────────────────
+            try:
+                count = store.count()
+            except StoreError as exc:
+                st.error(f"**Vector store error:** {exc}")
+                audit_logger.log_error("STORE", "COUNT_FAILURE", str(exc))
+                st.stop()
+
+            if count == 0:
                 st.warning("Upload and ingest at least one document first.")
                 st.stop()
 
-            with st.spinner("Searching knowledge base…"):
-                embedder   = get_embedder()
-                query_vec  = embedder.embed_one(question)
-                raw_hits   = store.query(query_vec, n_results=5)
+            # ── embed query ────────────────────────────────────────────────
+            try:
+                with st.spinner("Searching knowledge base…"):
+                    embedder  = _safe_get_embedder()
+                    query_vec = embedder.embed_one(question)
+                    raw_hits  = store.query(query_vec, n_results=5)
+            except EmbedderTimeoutError as exc:
+                st.error(f"**Embedding timed out:** {exc}")
+                audit_logger.log_error("EMBEDDER", "TIMEOUT", str(exc))
+                st.stop()
+            except EmbedderError as exc:
+                st.error(f"**Embedding failed:** {exc}")
+                audit_logger.log_error("EMBEDDER", "EMBED_FAILURE", str(exc))
+                st.stop()
+            except StoreError as exc:
+                st.error(f"**Search failed:** {exc}")
+                audit_logger.log_error("STORE", "QUERY_FAILURE", str(exc))
+                st.stop()
 
-            # ── GUARDRAIL 5: relevance threshold ──────────────────────────
+            # ── GUARDRAIL 5: relevance threshold ───────────────────────────
             retrieval_result = retrieval_guardrails.validate(raw_hits)
             if not retrieval_result.passed:
                 show_result(retrieval_result)
                 audit_logger.log_guardrail_violation(
-                    layer="RETRIEVAL",
-                    violation_type="LOW_RELEVANCE",
-                    details="; ".join(retrieval_result.violations),
+                    "RETRIEVAL", "LOW_RELEVANCE",
+                    "; ".join(retrieval_result.violations),
                 )
                 st.stop()
 
             hits = retrieval_guardrails.filter_relevant(raw_hits)
-
             audit_logger.log_query(
                 query_length=len(question),
                 pii_in_query=bool(input_result.warnings),
@@ -261,11 +341,21 @@ with chat_tab:
                 chunks_relevant=len(hits),
             )
 
-            with st.spinner("Generating answer…"):
-                answer = generate_answer_local(question, hits)
+            # ── generate ───────────────────────────────────────────────────
+            try:
+                with st.spinner("Generating answer…"):
+                    answer = generate_answer_local(question, hits)
+            except GeneratorTimeoutError as exc:
+                st.error(f"**Generation timed out:** {exc}")
+                audit_logger.log_error("GENERATOR", "TIMEOUT", str(exc))
+                st.stop()
+            except GeneratorError as exc:
+                st.error(f"**Generation failed:** {exc}")
+                audit_logger.log_error("GENERATOR", "GENERATE_FAILURE", str(exc))
+                st.stop()
 
-            # ── GUARDRAIL 6: output validation ────────────────────────────
-            output_result = output_guardrails.validate(answer, hits)
+            # ── GUARDRAIL 6: output validation ─────────────────────────────
+            output_result   = output_guardrails.validate(answer, hits)
             output_warnings = output_result.warnings
 
             audit_logger.log_answer(
@@ -273,12 +363,10 @@ with chat_tab:
                 pii_in_answer=any("PII" in w for w in output_warnings),
                 grounded=not any("grounded" in w.lower() for w in output_warnings),
             )
-
             if output_warnings:
                 audit_logger.log_guardrail_warning(
-                    layer="OUTPUT",
-                    warning_type="OUTPUT_QUALITY",
-                    details="; ".join(output_warnings),
+                    "OUTPUT", "OUTPUT_QUALITY",
+                    "; ".join(output_warnings),
                 )
 
             st.markdown(answer)
@@ -294,57 +382,55 @@ with chat_tab:
                     st.code(h["text"], language=None)
 
         st.session_state.messages.append({
-            "role": "assistant",
-            "content": answer,
-            "sources": hits,
+            "role":     "assistant",
+            "content":  answer,
+            "sources":  hits,
             "warnings": output_warnings,
         })
+        _trim_messages()
 
 
 # ── audit log tab ─────────────────────────────────────────────────────────────
 with audit_tab:
     st.title("🛡️ Audit Log")
-    st.caption("Append-only compliance trail — written to audit.log. "
-               "Query text and document content are never logged.")
+    st.caption(
+        "Rotating compliance trail (5 MB × 5 files → audit.log). "
+        "Query text and document content are never logged."
+    )
 
     if st.button("Refresh"):
         st.rerun()
 
-    logs = audit_logger.read_recent_logs(n=100)
+    try:
+        logs = audit_logger.read_recent_logs(n=100)
+    except Exception as exc:
+        st.error(f"Cannot read audit log: {exc}")
+        logs = []
 
     if not logs:
         st.info("No audit events yet. Ingest a document or ask a question.")
     else:
-        # Summary metrics
         events = [l["event"] for l in logs]
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Events",      len(logs))
-        col2.metric("Files Ingested",    events.count("FILE_INGESTED"))
-        col3.metric("Queries",           events.count("QUERY"))
-        col4.metric("Violations",        events.count("GUARDRAIL_VIOLATION"))
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Total Events",   len(logs))
+        c2.metric("Files Ingested", events.count("FILE_INGESTED"))
+        c3.metric("Queries",        events.count("QUERY"))
+        c4.metric("Violations",     events.count("GUARDRAIL_VIOLATION"))
+        c5.metric("System Errors",  events.count("SYSTEM_ERROR"))
 
         st.divider()
 
-        # Color-coded log entries
         for entry in logs:
             evt = entry.get("event", "")
             ts  = entry.get("timestamp", "")[:19].replace("T", " ")
 
-            if evt == "GUARDRAIL_VIOLATION":
+            if evt in ("GUARDRAIL_VIOLATION", "SYSTEM_ERROR") or entry.get("status") == "error":
                 badge = "🔴"
-                color = "red"
             elif evt == "GUARDRAIL_WARNING":
                 badge = "🟡"
-                color = "orange"
-            elif evt == "FILE_INGESTED" and entry.get("status") == "error":
-                badge = "🔴"
-                color = "red"
             else:
                 badge = "🟢"
-                color = "green"
 
-            details = {k: v for k, v in entry.items()
-                       if k not in ("event", "timestamp")}
-
+            details = {k: v for k, v in entry.items() if k not in ("event", "timestamp")}
             with st.expander(f"{badge} `{ts}` — **{evt}**"):
                 st.json(details)
