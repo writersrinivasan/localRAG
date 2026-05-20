@@ -17,6 +17,7 @@ from .exceptions import (
 )
 from . import guardrails
 from . import audit_logger
+from . import rag_logger
 
 __all__ = [
     "load_file", "chunk_text", "Embedder", "VectorStore", "generate_answer",
@@ -24,5 +25,5 @@ __all__ = [
     "EmbedderError", "EmbedderTimeoutError",
     "StoreError", "StoreUnavailableError",
     "GeneratorError", "GeneratorTimeoutError", "GeneratorAPIError",
-    "guardrails", "audit_logger",
+    "guardrails", "audit_logger", "rag_logger",
 ]

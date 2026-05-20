@@ -3,10 +3,13 @@ Simple RAG System — Streamlit UI with guardrails and full error handling.
 Run: streamlit run app.py
 """
 
+import math
 import os
 import tempfile
+import time
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 from rag.loader import load_file
@@ -24,7 +27,7 @@ from rag.guardrails import (
     file_guardrails, input_guardrails,
     retrieval_guardrails, output_guardrails, pii_detector,
 )
-from rag import audit_logger
+from rag import audit_logger, rag_logger
 
 SUPPORTED    = [".txt", ".md", ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".pptx"]
 MAX_MESSAGES = 50   # cap session history to prevent unbounded RAM growth
@@ -84,6 +87,14 @@ def _trim_messages() -> None:
     """Keep only the last MAX_MESSAGES entries to cap RAM usage."""
     if len(st.session_state.messages) > MAX_MESSAGES:
         st.session_state.messages = st.session_state.messages[-MAX_MESSAGES:]
+
+
+def _vec_stats(vec):
+    """Return (dim, norm, mean, min, max) for an embedding vector."""
+    dim  = len(vec)
+    norm = math.sqrt(sum(x * x for x in vec))
+    mean = sum(vec) / dim
+    return dim, norm, mean, min(vec), max(vec)
 
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
@@ -157,10 +168,26 @@ with st.sidebar:
 
                 # ── embed + store ─────────────────────────────────────────
                 with st.spinner(f"Embedding {len(chunks)} chunks…"):
+                    _t_embed = time.perf_counter()
                     embeddings = embedder.embed(chunks)
+                    _ingest_embed_time = time.perf_counter() - _t_embed
 
                 added  = store.add(chunks, embeddings, meta)
                 total += added
+
+                # ── RAG Inspector: ingest diagnostics ─────────────────────
+                _chunk_sizes = [len(c) for c in chunks]
+                _ingest_dim  = len(embeddings[0]) if embeddings else 384
+                rag_logger.log_ingest_diagnostics(
+                    filename=uf.name,
+                    chunk_count=len(chunks),
+                    avg_chunk_size=sum(_chunk_sizes) / len(_chunk_sizes),
+                    min_chunk_size=min(_chunk_sizes),
+                    max_chunk_size=max(_chunk_sizes),
+                    embed_time_s=_ingest_embed_time,
+                    embed_dim=_ingest_dim,
+                )
+
                 audit_logger.log_ingest(
                     filename=uf.name, size_kb=size_bytes / 1024,
                     chunks_added=added, pii_types_found=pii_found,
@@ -234,7 +261,7 @@ with st.sidebar:
 
 
 # ── tabs ──────────────────────────────────────────────────────────────────────
-chat_tab, audit_tab = st.tabs(["💬 Chat", "🛡️ Audit Log"])
+chat_tab, rag_tab, audit_tab = st.tabs(["💬 Chat", "📊 RAG Inspector", "🛡️ Audit Log"])
 
 
 # ── chat tab ──────────────────────────────────────────────────────────────────
@@ -304,12 +331,19 @@ with chat_tab:
                 st.warning("Upload and ingest at least one document first.")
                 st.stop()
 
-            # ── embed query ────────────────────────────────────────────────
+            # ── embed query + retrieve ──────────────────────────────────────
             try:
                 with st.spinner("Searching knowledge base…"):
-                    embedder  = _safe_get_embedder()
+                    embedder = _safe_get_embedder()
+
+                    _t0 = time.perf_counter()
                     query_vec = embedder.embed_one(question)
-                    raw_hits  = store.query(query_vec, n_results=5)
+                    _embed_time = time.perf_counter() - _t0
+
+                    _t1 = time.perf_counter()
+                    raw_hits = store.query(query_vec, n_results=5)
+                    _retrieve_time = time.perf_counter() - _t1
+
             except EmbedderTimeoutError as exc:
                 st.error(f"**Embedding timed out:** {exc}")
                 audit_logger.log_error("EMBEDDER", "TIMEOUT", str(exc))
@@ -344,7 +378,10 @@ with chat_tab:
             # ── generate ───────────────────────────────────────────────────
             try:
                 with st.spinner("Generating answer…"):
+                    _t2 = time.perf_counter()
                     answer = generate_answer_local(question, hits)
+                    _generate_time = time.perf_counter() - _t2
+
             except GeneratorTimeoutError as exc:
                 st.error(f"**Generation timed out:** {exc}")
                 audit_logger.log_error("GENERATOR", "TIMEOUT", str(exc))
@@ -369,6 +406,25 @@ with chat_tab:
                     "; ".join(output_warnings),
                 )
 
+            # ── RAG Inspector: query diagnostics ───────────────────────────
+            _total_time = _embed_time + _retrieve_time + _generate_time
+            _dim, _norm, _mean, _vmin, _vmax = _vec_stats(query_vec)
+            rag_logger.log_query_diagnostics(
+                query_len=len(question),
+                embed_time_s=_embed_time,
+                embed_dim=_dim,
+                embed_norm=_norm,
+                embed_mean=_mean,
+                embed_min=_vmin,
+                embed_max=_vmax,
+                retrieve_time_s=_retrieve_time,
+                chunk_distances=[h["distance"] for h in hits],
+                context_chars=sum(len(h["text"]) for h in hits),
+                generate_time_s=_generate_time,
+                answer_len=len(answer),
+                total_time_s=_total_time,
+            )
+
             st.markdown(answer)
             for w in output_warnings:
                 st.warning(f"**Notice:** {w}")
@@ -388,6 +444,143 @@ with chat_tab:
             "warnings": output_warnings,
         })
         _trim_messages()
+
+
+# ── RAG Inspector tab ─────────────────────────────────────────────────────────
+with rag_tab:
+    st.title("📊 RAG Inspector")
+    st.caption(
+        "Live pipeline diagnostics: per-step timing, embedding vector statistics, "
+        "and chunk similarity scores. Logged to rag_diagnostics.log."
+    )
+
+    if st.button("Refresh", key="rag_refresh"):
+        st.rerun()
+
+    try:
+        diag_logs   = rag_logger.read_recent_logs(n=200)
+    except Exception as exc:
+        st.error(f"Cannot read RAG diagnostics log: {exc}")
+        diag_logs = []
+
+    query_logs  = [l for l in diag_logs if l.get("event") == "QUERY_DIAGNOSTICS"]
+    ingest_logs = [l for l in diag_logs if l.get("event") == "INGEST_DIAGNOSTICS"]
+
+    # ── summary metrics ────────────────────────────────────────────────────
+    def _avg(logs, key):
+        vals = [l[key] for l in logs if key in l]
+        return round(sum(vals) / len(vals), 3) if vals else 0.0
+
+    mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+    mc1.metric("Total Queries",    len(query_logs))
+    mc2.metric("Total Ingests",    len(ingest_logs))
+    mc3.metric("Avg Embed (s)",    _avg(query_logs, "embed_time_s"))
+    mc4.metric("Avg Retrieve (s)", _avg(query_logs, "retrieve_time_s"))
+    mc5.metric("Avg Generate (s)", _avg(query_logs, "generate_time_s"))
+
+    st.divider()
+
+    # ── last query breakdown ───────────────────────────────────────────────
+    if query_logs:
+        last = query_logs[0]   # newest first
+        ts   = last.get("timestamp", "")[:19].replace("T", " ")
+        st.subheader(f"Last Query  —  `{ts} UTC`")
+
+        # Pipeline timing visualization
+        st.markdown("**Pipeline Timing**")
+        steps = {
+            "🔢 Embed query": last.get("embed_time_s", 0),
+            "🔍 Retrieve":    last.get("retrieve_time_s", 0),
+            "✍️ Generate":    last.get("generate_time_s", 0),
+        }
+        total_t = last.get("total_time_s", 1) or 1
+        for label, t in steps.items():
+            col_label, col_bar, col_val = st.columns([2, 6, 2])
+            col_label.markdown(label)
+            col_bar.progress(min(t / total_t, 1.0))
+            col_val.markdown(f"`{t:.3f} s`")
+        st.caption(f"Total pipeline time: **{last.get('total_time_s', 0):.3f} s**")
+
+        st.divider()
+
+        # Embedding vector statistics
+        st.markdown("**Embedding Vector Statistics**")
+        vc1, vc2, vc3, vc4, vc5 = st.columns(5)
+        vc1.metric("Dimensions",  last.get("embed_dim", 384))
+        vc2.metric("L2 Norm",     f"{last.get('embed_norm', 0):.3f}")
+        vc3.metric("Mean",        f"{last.get('embed_mean', 0):.4f}")
+        vc4.metric("Min",         f"{last.get('embed_min', 0):.4f}")
+        vc5.metric("Max",         f"{last.get('embed_max', 0):.4f}")
+        st.caption(
+            "The L2 norm of a unit-normalised sentence-transformer vector is typically close to 1. "
+            "Large norms indicate un-normalised vectors from a custom model."
+        )
+
+        st.divider()
+
+        # Chunk similarity scores
+        distances = last.get("chunk_distances", [])
+        if distances:
+            st.markdown("**Retrieved Chunk Similarity** — lower distance = more relevant")
+            for i, dist in enumerate(distances, 1):
+                similarity = max(0.0, 1.0 - dist)   # cosine distance → similarity
+                col_rank, col_bar, col_score = st.columns([1, 7, 2])
+                col_rank.markdown(f"Chunk {i}")
+                col_bar.progress(similarity)
+                col_score.markdown(f"`dist: {dist:.4f}`")
+
+            st.caption(
+                f"Query: **{last.get('query_len', 0)} chars** · "
+                f"Context: **{last.get('context_chars', 0)} chars** · "
+                f"Answer: **{last.get('answer_len', 0)} chars**"
+            )
+
+    else:
+        st.info("No query diagnostics yet. Ask a question in the Chat tab first.")
+
+    st.divider()
+
+    # ── query history table ────────────────────────────────────────────────
+    if query_logs:
+        st.subheader("Query History")
+        rows = []
+        for entry in query_logs:
+            ts = entry.get("timestamp", "")[:19].replace("T", " ")
+            rows.append({
+                "Time (UTC)":   ts,
+                "Query len":    entry.get("query_len", ""),
+                "Embed (s)":    entry.get("embed_time_s", ""),
+                "Retrieve (s)": entry.get("retrieve_time_s", ""),
+                "Generate (s)": entry.get("generate_time_s", ""),
+                "Total (s)":    entry.get("total_time_s", ""),
+                "Chunks":       len(entry.get("chunk_distances", [])),
+                "Answer len":   entry.get("answer_len", ""),
+                "Embed dim":    entry.get("embed_dim", ""),
+                "L2 norm":      entry.get("embed_norm", ""),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── ingest history table ───────────────────────────────────────────────
+    if ingest_logs:
+        st.subheader("Ingest History")
+        rows = []
+        for entry in ingest_logs:
+            ts = entry.get("timestamp", "")[:19].replace("T", " ")
+            rows.append({
+                "Time (UTC)":     ts,
+                "File":           entry.get("filename", ""),
+                "Chunks":         entry.get("chunk_count", ""),
+                "Avg chunk size": entry.get("avg_chunk_size", ""),
+                "Min chunk size": entry.get("min_chunk_size", ""),
+                "Max chunk size": entry.get("max_chunk_size", ""),
+                "Embed time (s)": entry.get("embed_time_s", ""),
+                "Embed dim":      entry.get("embed_dim", ""),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    elif not query_logs:
+        st.info("No ingest diagnostics yet. Upload and ingest a document first.")
 
 
 # ── audit log tab ─────────────────────────────────────────────────────────────

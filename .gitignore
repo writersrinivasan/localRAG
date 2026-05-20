@@ -30,3 +30,9 @@ chroma_db/
 # IDE
 .vscode/
 .idea/
+
+# Runtime logs (generated at runtime, not source)
+audit.log
+audit.log.*
+rag_diagnostics.log
+rag_diagnostics.log.*
