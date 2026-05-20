@@ -97,28 +97,30 @@ class FileGuardrails:
         result = GuardrailResult(passed=True)
         ext = Path(original_filename).suffix.lower()
 
-        # 1. Extension whitelist
+        # 1. Filename sanitization — checked FIRST: path traversal is a critical
+        #    security issue regardless of extension and must not be skipped.
+        if ".." in original_filename or original_filename.startswith("/"):
+            result.passed = False
+            result.violations.append(
+                f"Filename '{original_filename}' contains unsafe path characters."
+            )
+            return result   # stop immediately — do not touch this file
+
+        # 2. Extension whitelist
         if ext not in self.ALLOWED_EXTENSIONS:
             result.passed = False
             result.violations.append(
                 f"File type '{ext}' is not allowed. "
                 f"Permitted: {', '.join(sorted(self.ALLOWED_EXTENSIONS))}"
             )
-            return result   # stop here — no point reading a disallowed file
+            return result   # no point reading a disallowed file
 
-        # 2. File size
+        # 3. File size
         size_mb = file_size_bytes / (1024 * 1024)
         if size_mb > self.MAX_SIZE_MB:
             result.passed = False
             result.violations.append(
                 f"File size {size_mb:.1f} MB exceeds limit of {self.MAX_SIZE_MB} MB."
-            )
-
-        # 3. Filename sanitization — reject path-traversal attempts
-        if ".." in original_filename or original_filename.startswith("/"):
-            result.passed = False
-            result.violations.append(
-                f"Filename '{original_filename}' contains unsafe path characters."
             )
 
         # 4. MIME / magic-byte check for binary formats
@@ -178,7 +180,7 @@ class InputGuardrails:
         r"pretend\s+(you\s+are|to\s+be)",
         r"new\s+instructions\s*:",
         r"<\s*/?system\s*>",           # XML-style injection
-        r"\[INST\]|\[\/INST\]",        # Llama instruction markers
+        r"\[inst\]|\[\/inst\]",          # Llama [INST] markers (matched after lowercasing)
     ]
 
     def validate(self, query: str) -> GuardrailResult:
